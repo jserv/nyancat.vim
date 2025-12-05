@@ -493,6 +493,16 @@ function! Nyan() abort
     let l:frame_width = len(l:frames[0][0])
     let l:frame_height = len(l:frames[0])
 
+    " Verify the scaled frame plus chrome fits the current screen
+    let l:req = s:GetRequiredSize(l:frame_width, l:frame_height)
+    if &columns < l:req.cols || &lines < l:req.lines
+        echohl WarningMsg
+        echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+            \ l:req.cols, l:req.lines, &columns, &lines)
+        echohl None
+        return
+    endif
+
     " Get border configuration
     let l:border_chars = s:GetBorderStyle()
     let l:has_border = !empty(l:border_chars)
