@@ -19,6 +19,17 @@ endif
 let s:BASE_FRAME_WIDTH = 110
 let s:BASE_FRAME_HEIGHT = 22
 
+" Configuration variables
+" Frame delay in milliseconds. User can override with g:nyancat_frame_delay.
+let s:frame_delay = get(g:, 'nyancat_frame_delay', 85)
+
+" Status message text. User can override with g:nyancat_message.
+let s:message_text = get(g:, 'nyancat_message', 'Press any key to close')
+
+" Precompute frames for performance optimization (0=disabled, 1=enabled)
+" This loads common scale factors into memory at startup to avoid real-time scaling
+let s:precompute_frames = get(g:, 'nyancat_precompute_frames', 0)
+
 " Border style: 0=none, 1=ascii, 2=single, 3=double, 4=rounded, 5=thick
 " User can override with g:nyancat_border_style
 let s:BORDER_STYLES = {
@@ -45,6 +56,22 @@ endfunction
 
 " Cache for scaled animation frames
 let s:scaled_frames_cache = {}
+
+" Pre-computed common scale factors to optimize animation performance
+function! s:PrecomputeCommonScales() abort
+    " Define common scale factors to pre-compute (from 0.1 to 1.0 in 0.1 increments)
+    let l:common_scales = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+    " Precompute frames for each scale factor
+    for l:scale in l:common_scales
+        call s:GetScaledFrames(l:scale)
+    endfor
+endfunction
+
+" Initialize precomputed scales on plugin load (if enabled)
+if s:precompute_frames
+    call s:PrecomputeCommonScales()
+endif
 
 " Scale animation frames to a new size using nearest-neighbor sampling.
 " Returns a list of frames, where each frame is a list of strings.
@@ -418,11 +445,7 @@ highlight NyanBorderLightBlue ctermbg=17 ctermfg=33  guibg=#003153 guifg=#0087ff
 highlight NyanBorderDarkBlue  ctermbg=17 ctermfg=19  guibg=#003153 guifg=#0000af
 
 
-" Frame delay in milliseconds. User can override with g:nyancat_frame_delay.
-let s:frame_delay = get(g:, 'nyancat_frame_delay', 85)
-
-" Status message text. User can override with g:nyancat_message.
-let s:message_text = get(g:, 'nyancat_message', 'Press any key to close')
+" Note: frame_delay and message_text are defined earlier in the file
 
 function! s:SetupSyntax(winid) abort
     call win_execute(a:winid, 'syntax clear')
@@ -515,7 +538,7 @@ function! Nyan() abort
         let l:border_chars = s:GetBorderStyle()
         let l:has_border = !empty(l:border_chars)
         let l:border_extra = l:has_border ? 2 : 0
-        
+
         " Calculate the maximum scale factor based on available screen space
         let l:max_cols_for_content = &columns - l:border_extra
         let l:max_lines_for_content = &lines - l:border_extra - &cmdheight - 1 - 2 " Minus blank line and status line inside popup
@@ -575,8 +598,18 @@ function! Nyan() abort
 
     " Animation loop - press any key to exit
     let l:color_index = 0
+
+    " Pre-allocate frame index to avoid repeated calculations
+    let l:frame_idx = 0
+    let l:frame_count = len(l:frames)
+
     while 1
-        for l:frame in l:frames
+        " Iterate through frames with optimized loop
+        let l:frame_idx = 0
+        while l:frame_idx < l:frame_count
+            let l:frame = l:frames[l:frame_idx]
+
+            " Check for resize before rendering frame
             if &columns != l:last_cols || &lines != l:last_lines
                 let l:last_cols = &columns
                 let l:last_lines = &lines
@@ -597,6 +630,7 @@ function! Nyan() abort
                     let l:scale_h = (l:max_lines_for_content * 1.0) / s:BASE_FRAME_HEIGHT
                     let l:scale = min([l:scale_w, l:scale_h, 1.0])
                     let l:frames = s:GetScaledFrames(l:scale)
+                    let l:frame_count = len(l:frames) " Update frame count
                     if empty(l:frames) || empty(l:frames[0])
                         call popup_close(l:winid)
                         echohl WarningMsg
@@ -624,10 +658,10 @@ function! Nyan() abort
                 let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
                 call s:SetupSyntax(l:winid)
                 let l:status_line = s:BuildStatusLine(l:frame_width)
-                redraw!
+                redraw
                 " Reset color index when recreating popup
                 let l:color_index = 0
-                break
+                break " Break to outer while loop to restart frame rendering
             endif
 
             if l:use_rainbow_border
@@ -637,13 +671,17 @@ function! Nyan() abort
             endif
 
             call popup_settext(l:winid, l:frame + ['', l:status_line])
+
+            " Redraw with proper timing to reduce flickering
             redraw
             if getchar(0)
                 call popup_close(l:winid)
                 return
             endif
             execute 'sleep' s:frame_delay . 'm'
-        endfor
+
+            let l:frame_idx += 1
+        endwhile
     endwhile
 endfunction
 
