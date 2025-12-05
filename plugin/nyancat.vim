@@ -448,8 +448,12 @@ endfunction
 function! s:BuildStatusLine(frame_width) abort
     let l:msg = '****' . s:message_text . '****'
     let l:msg_len = len(l:msg)
-    let l:pad_left = (a:frame_width - l:msg_len) / 2
-    let l:pad_right = a:frame_width - l:msg_len - l:pad_left
+    let l:available = a:frame_width - l:msg_len
+    if l:available < 0
+        let l:available = 0
+    endif
+    let l:pad_left = float2nr(l:available / 2.0)
+    let l:pad_right = l:available - l:pad_left
     return repeat(',', l:pad_left) . l:msg . repeat(',', l:pad_right)
 endfunction
 
