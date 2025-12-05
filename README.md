@@ -1,5 +1,6 @@
 # Nyancat.vim
 Animated [Nyan Cat](https://www.youtube.com/watch?v=QH2-TGUlwu4) in a Vim popup window with full rainbow colors, auto-scaling, and a customizable border.
+![Nyan Cat GIF](assets/nyancat.gif)
 
 ## Features
 - Smooth Nyan Cat animation in a central popup window
