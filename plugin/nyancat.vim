@@ -446,15 +446,33 @@ endfunction
 
 " Build the status line with message centered in frame
 function! s:BuildStatusLine(frame_width) abort
-    let l:msg = '****' . s:message_text . '****'
-    let l:msg_len = len(l:msg)
-    let l:available = a:frame_width - l:msg_len
-    if l:available < 0
-        let l:available = 0
+    let l:decor = '****'
+    let l:max_msg_width = a:frame_width - (2 * strdisplaywidth(l:decor))
+    if l:max_msg_width < 0
+        let l:max_msg_width = 0
     endif
+
+    " Trim the message to fit the frame width (display width aware)
+    let l:msg = s:message_text
+    if strdisplaywidth(l:msg) > l:max_msg_width
+        let l:msg = ''
+        let l:i = 0
+        while l:i < strchars(s:message_text)
+            let l:char = strcharpart(s:message_text, l:i, 1)
+            if strdisplaywidth(l:msg . l:char) > l:max_msg_width
+                break
+            endif
+            let l:msg .= l:char
+            let l:i += 1
+        endwhile
+    endif
+
+    let l:full_msg = l:decor . l:msg . l:decor
+    let l:full_width = strdisplaywidth(l:full_msg)
+    let l:available = max([a:frame_width - l:full_width, 0])
     let l:pad_left = float2nr(l:available / 2.0)
     let l:pad_right = l:available - l:pad_left
-    return repeat(',', l:pad_left) . l:msg . repeat(',', l:pad_right)
+    return repeat(',', l:pad_left) . l:full_msg . repeat(',', l:pad_right)
 endfunction
 
 function! Nyan() abort
