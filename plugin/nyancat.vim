@@ -479,8 +479,9 @@ function! Nyan() abort
     " Scaling: 0=auto, >0=fixed factor. User can override with g:nyancat_scale.
     let l:user_scale = get(g:, 'nyancat_scale', 0)
     let l:scale = l:user_scale
+    let l:auto_scale = (l:user_scale == 0)
 
-    if l:scale == 0 " Auto-scaling
+    if l:auto_scale " Auto-scaling
         let l:border_chars = s:GetBorderStyle()
         let l:has_border = !empty(l:border_chars)
         let l:border_extra = l:has_border ? 2 : 0
@@ -551,6 +552,10 @@ function! Nyan() abort
     call s:SetupSyntax(l:winid)
 
     let l:status_line = s:BuildStatusLine(l:frame_width)
+    let l:last_cols = &columns
+    let l:last_lines = &lines
+    let l:border_chars = s:GetBorderStyle()
+    let l:has_border = !empty(l:border_chars)
 
     " Rainbow border setup
     let l:use_rainbow_border = l:has_border && get(g:, 'nyancat_rainbow_border', 1)
@@ -565,6 +570,76 @@ function! Nyan() abort
     " Animation loop - press any key to exit
     while 1
         for l:frame in l:frames
+            if &columns != l:last_cols || &lines != l:last_lines
+                let l:last_cols = &columns
+                let l:last_lines = &lines
+                if l:auto_scale
+                    let l:border_extra = l:has_border ? 2 : 0
+                    let l:max_cols_for_content = &columns - l:border_extra
+                    let l:max_lines_for_content = &lines - l:border_extra - &cmdheight - 1 - 2
+                    if l:max_cols_for_content <= 0 || l:max_lines_for_content <= 0
+                        call popup_close(l:winid)
+                        echohl WarningMsg
+                        echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+                            \ s:BASE_FRAME_WIDTH + l:border_extra, s:BASE_FRAME_HEIGHT + l:border_extra + &cmdheight + 1 + 2,
+                            \ &columns, &lines)
+                        echohl None
+                        return
+                    endif
+                    let l:scale_w = (l:max_cols_for_content * 1.0) / s:BASE_FRAME_WIDTH
+                    let l:scale_h = (l:max_lines_for_content * 1.0) / s:BASE_FRAME_HEIGHT
+                    let l:scale = min([l:scale_w, l:scale_h, 1.0])
+                    let l:frames = s:GetScaledFrames(l:scale)
+                    if empty(l:frames) || empty(l:frames[0])
+                        call popup_close(l:winid)
+                        echohl WarningMsg
+                        echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+                            \ s:BASE_FRAME_WIDTH + l:border_extra, s:BASE_FRAME_HEIGHT + l:border_extra + &cmdheight + 1 + 2,
+                            \ &columns, &lines)
+                        echohl None
+                        return
+                    endif
+                endif
+
+                let l:frame_width = len(l:frames[0][0])
+                let l:frame_height = len(l:frames[0])
+                let l:req = s:GetRequiredSize(l:frame_width, l:frame_height)
+                if &columns < l:req.cols || &lines < l:req.lines
+                    call popup_close(l:winid)
+                    echohl WarningMsg
+                    echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+                        \ l:req.cols, l:req.lines, &columns, &lines)
+                    echohl None
+                    return
+                endif
+
+                " Recreate popup to match the new size
+                let l:opts = {
+                    \ 'highlight': 'NyanBlue',
+                    \ 'minwidth': l:frame_width,
+                    \ 'maxwidth': l:frame_width,
+                    \ 'minheight': l:frame_height + 2,
+                    \ 'maxheight': l:frame_height + 2,
+                    \ 'pos': 'center',
+                    \ 'zindex': 100,
+                    \ }
+                if l:has_border
+                    let l:opts['border'] = [1, 1, 1, 1]
+                    let l:opts['borderchars'] = l:border_chars
+                    let l:opts['borderhighlight'] = [l:use_rainbow_border ? l:rainbow_highlights[l:color_index] : 'NyanBorder']
+                    let l:opts['padding'] = [0, 0, 0, 0]
+                endif
+                call popup_close(l:winid)
+                let l:winid = popup_create('', l:opts)
+                call s:SetupSyntax(l:winid)
+                let l:status_line = s:BuildStatusLine(l:frame_width)
+                if l:use_rainbow_border
+                    let l:color_index = 0
+                endif
+                redraw!
+                break
+            endif
+
             if l:use_rainbow_border
                 let l:opts['borderhighlight'] = [l:rainbow_highlights[l:color_index]]
                 call popup_setoptions(l:winid, l:opts)
