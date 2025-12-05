@@ -422,7 +422,7 @@ highlight NyanBorderDarkBlue  ctermbg=17 ctermfg=19  guibg=#003153 guifg=#0000af
 let s:frame_delay = get(g:, 'nyancat_frame_delay', 85)
 
 " Status message text. User can override with g:nyancat_message.
-let s:message_text = get(g:, 'nyancat_message', 'Press Enter to close')
+let s:message_text = get(g:, 'nyancat_message', 'Press any key to close')
 
 function! s:SetupSyntax(winid) abort
     call win_execute(a:winid, 'syntax clear')
@@ -473,6 +473,36 @@ function! s:BuildStatusLine(frame_width) abort
     let l:pad_left = float2nr(l:available / 2.0)
     let l:pad_right = l:available - l:pad_left
     return repeat(',', l:pad_left) . l:full_msg . repeat(',', l:pad_right)
+endfunction
+
+" Helper function to create or recreate the popup window
+function! s:CreatePopup(frame_width, frame_height, has_border, use_rainbow_border, rainbow_highlights, color_index) abort
+    " Content height: frame + empty line + status line
+    let l:content_height = a:frame_height + 2
+
+    " Build popup options
+    let l:opts = {
+        \ 'highlight': 'NyanBlue',
+        \ 'minwidth': a:frame_width,
+        \ 'maxwidth': a:frame_width,
+        \ 'minheight': l:content_height,
+        \ 'maxheight': l:content_height,
+        \ 'pos': 'center',
+        \ 'zindex': 100,
+        \ }
+
+    " Add border if enabled
+    if a:has_border
+        let l:opts['border'] = [1, 1, 1, 1]
+        let l:border_chars = s:GetBorderStyle()
+        let l:opts['borderchars'] = l:border_chars
+        let l:opts['borderhighlight'] = [a:use_rainbow_border && !empty(a:rainbow_highlights) ? a:rainbow_highlights[a:color_index] : 'NyanBorder']
+        let l:opts['padding'] = [0, 0, 0, 0]
+    else
+        let l:opts['borderhighlight'] = ['NyanBorder']
+    endif
+
+    return popup_create('', l:opts)
 endfunction
 
 function! Nyan() abort
@@ -526,37 +556,6 @@ function! Nyan() abort
     let l:border_chars = s:GetBorderStyle()
     let l:has_border = !empty(l:border_chars)
 
-    " Content height: frame + empty line + status line
-    let l:content_height = l:frame_height + 2
-
-    " Build popup options
-    let l:opts = {
-        \ 'highlight': 'NyanBlue',
-        \ 'minwidth': l:frame_width,
-        \ 'maxwidth': l:frame_width,
-        \ 'minheight': l:content_height,
-        \ 'maxheight': l:content_height,
-        \ 'pos': 'center',
-        \ 'zindex': 100,
-        \ }
-
-    " Add border if enabled
-    if l:has_border
-        let l:opts['border'] = [1, 1, 1, 1]
-        let l:opts['borderchars'] = l:border_chars
-        let l:opts['borderhighlight'] = ['NyanBorder']
-        let l:opts['padding'] = [0, 0, 0, 0]
-    endif
-
-    let l:winid = popup_create('', l:opts)
-    call s:SetupSyntax(l:winid)
-
-    let l:status_line = s:BuildStatusLine(l:frame_width)
-    let l:last_cols = &columns
-    let l:last_lines = &lines
-    let l:border_chars = s:GetBorderStyle()
-    let l:has_border = !empty(l:border_chars)
-
     " Rainbow border setup
     let l:use_rainbow_border = l:has_border && get(g:, 'nyancat_rainbow_border', 1)
     if l:use_rainbow_border
@@ -567,7 +566,15 @@ function! Nyan() abort
         let l:color_index = 0
     endif
 
+    let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
+    call s:SetupSyntax(l:winid)
+
+    let l:status_line = s:BuildStatusLine(l:frame_width)
+    let l:last_cols = &columns
+    let l:last_lines = &lines
+
     " Animation loop - press any key to exit
+    let l:color_index = 0
     while 1
         for l:frame in l:frames
             if &columns != l:last_cols || &lines != l:last_lines
@@ -613,35 +620,18 @@ function! Nyan() abort
                     return
                 endif
 
-                " Recreate popup to match the new size
-                let l:opts = {
-                    \ 'highlight': 'NyanBlue',
-                    \ 'minwidth': l:frame_width,
-                    \ 'maxwidth': l:frame_width,
-                    \ 'minheight': l:frame_height + 2,
-                    \ 'maxheight': l:frame_height + 2,
-                    \ 'pos': 'center',
-                    \ 'zindex': 100,
-                    \ }
-                if l:has_border
-                    let l:opts['border'] = [1, 1, 1, 1]
-                    let l:opts['borderchars'] = l:border_chars
-                    let l:opts['borderhighlight'] = [l:use_rainbow_border ? l:rainbow_highlights[l:color_index] : 'NyanBorder']
-                    let l:opts['padding'] = [0, 0, 0, 0]
-                endif
                 call popup_close(l:winid)
-                let l:winid = popup_create('', l:opts)
+                let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
                 call s:SetupSyntax(l:winid)
                 let l:status_line = s:BuildStatusLine(l:frame_width)
-                if l:use_rainbow_border
-                    let l:color_index = 0
-                endif
                 redraw!
+                " Reset color index when recreating popup
+                let l:color_index = 0
                 break
             endif
 
             if l:use_rainbow_border
-                let l:opts['borderhighlight'] = [l:rainbow_highlights[l:color_index]]
+                let l:opts = {'borderhighlight': [l:rainbow_highlights[l:color_index]]}
                 call popup_setoptions(l:winid, l:opts)
                 let l:color_index = (l:color_index + 1) % len(l:rainbow_highlights)
             endif
