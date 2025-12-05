@@ -441,7 +441,7 @@ function! s:SetupSyntax(winid) abort
     call win_execute(a:winid, 'syntax match NyanGray /\*/')
     call win_execute(a:winid, 'syntax match NyanPink /%/')
     " Use \V (very nomagic) to match message literally
-    call win_execute(a:winid, 'syntax match NyanMessage /\V' . escape(s:message_text, '/') . '/')
+    call win_execute(a:winid, 'syntax match NyanMessage /\V' . escape(s:message_text, '/\\') . '/')
 endfunction
 
 " Build the status line with message centered in frame
