@@ -1,5 +1,4 @@
 " Nyancat on your Vim
-"
 
 " Prevent double-loading
 if exists('g:loaded_nyancat')
@@ -32,6 +31,44 @@ let s:nyan_winid = -1
 let s:syntax_winid = -1
 let s:resize_timer = -1
 let s:debounce_ms = 50  " 50ms debounce window
+
+" Cached border style for performance optimization
+let s:cached_border_chars = []
+let s:cached_has_border = 0
+
+function! s:CacheBorderStyle() abort
+    let s:cached_border_chars = s:GetBorderStyle()
+    let s:cached_has_border = !empty(s:cached_border_chars)
+endfunction
+
+" Configuration validation function
+function! s:ValidateConfig() abort
+    " Validate frame_delay (must be positive integer)
+    let l:delay = get(g:, 'nyancat_frame_delay', 85)
+    if type(l:delay) != v:t_number || l:delay < 1
+        echohl WarningMsg
+        echomsg 'nyancat: Invalid frame_delay, using default (85ms)'
+        echohl None
+        let l:delay = 85
+    endif
+    let s:frame_delay = l:delay
+
+    " Validate border_style (must be 0-5)
+    let l:style = get(g:, 'nyancat_border_style', 2)
+    if type(l:style) != v:t_number || l:style < 0 || l:style > 5
+        echohl WarningMsg
+        echomsg 'nyancat: Invalid border_style (0-5), using default (2)'
+        echohl None
+    endif
+
+    " Validate scale (must be 0 or positive)
+    let l:scale = get(g:, 'nyancat_scale', 0)
+    if type(l:scale) != v:t_number || l:scale < 0
+        echohl WarningMsg
+        echomsg 'nyancat: Invalid scale, using auto-scale (0)'
+        echohl None
+    endif
+endfunction
 
 " Border style: 0=none, 1=ascii, 2=single, 3=double, 4=rounded, 5=thick
 " User can override with g:nyancat_border_style
@@ -77,6 +114,12 @@ function! s:HandleDebouncedResize() abort
     let s:resize_pending = 1
 endfunction
 
+" Clear any existing autocommands from previous load
+augroup NyanResize
+    autocmd!
+augroup END
+
+" Later, define the autocommand:
 augroup NyanResize
     autocmd!
     autocmd VimResized * call s:OnResize()
@@ -94,13 +137,11 @@ function! s:GetRequiredSize(frame_width, frame_height) abort
         \ }
 endfunction
 
-" Helper function for scale calculation (Issue #4)
+" Helper function for scale calculation using fixed-point arithmetic
 " Calculate scale factor using fixed-point arithmetic (scale * 100)
 " Returns scale factor where 100 = 1.0x
 function! s:CalculateScaleFactor() abort
-    let l:border_chars = s:GetBorderStyle()
-    let l:has_border = !empty(l:border_chars)
-    let l:border_extra = l:has_border ? 2 : 0
+    let l:border_extra = s:cached_has_border ? 2 : 0
 
     let l:available_width = (&columns - l:border_extra) * 100
     let l:available_height = (&lines - l:border_extra - &cmdheight - 1 - 2) * 100
@@ -111,12 +152,12 @@ function! s:CalculateScaleFactor() abort
     return l:scale_w < l:scale_h ? l:scale_w : l:scale_h
 endfunction
 
-" Helper function for border fallback (Issue #4)
+" Helper function for border fallback to borderless mode
 " Check if animation fits, with fallback to borderless mode
 " Returns: {'fits': bool, 'has_border': bool, 'border_chars': list, 'req': dict}
 function! s:CheckFitWithBorderFallback(frame_width, frame_height) abort
-    let l:border_chars = s:GetBorderStyle()
-    let l:has_border = !empty(l:border_chars)
+    let l:border_chars = s:cached_border_chars
+    let l:has_border = s:cached_has_border
 
     let l:req = s:GetRequiredSize(a:frame_width, a:frame_height)
     let l:fits = (&columns >= l:req.cols && &lines >= l:req.lines)
@@ -455,6 +496,20 @@ highlight NyanBorderDarkBlue  ctermbg=17 ctermfg=19  guibg=#003153 guifg=#0000af
 
 " Note: frame_delay and message_text are defined earlier in the file
 
+" Cleanup function for consistent state reset
+function! s:Cleanup() abort
+    if s:nyan_winid != -1
+        silent! call popup_close(s:nyan_winid)
+    endif
+    let s:nyan_winid = -1
+    let s:syntax_winid = -1
+    let s:resize_pending = 0
+    if s:resize_timer != -1
+        call timer_stop(s:resize_timer)
+        let s:resize_timer = -1
+    endif
+endfunction
+
 function! s:SetupSyntax(winid) abort
     " Skip if syntax already applied to this window
     if s:syntax_winid == a:winid
@@ -490,7 +545,7 @@ function! s:BuildStatusLine(frame_width) abort
         let l:max_msg_width = 0
     endif
 
-    " Trim the message to fit the frame width (display width aware) - Issue #7 optimization
+    " Trim the message to fit the frame width (display width aware)
     let l:msg = s:message_text
     if strdisplaywidth(l:msg) > l:max_msg_width
         " Calculate character count that fits, then slice once
@@ -514,7 +569,7 @@ function! s:BuildStatusLine(frame_width) abort
     let l:full_msg = l:decor . l:msg . l:decor
     let l:full_width = strdisplaywidth(l:full_msg)
     let l:available = max([l:fw - l:full_width, 0])
-    let l:pad_left = float2nr(l:available / 2.0)
+    let l:pad_left = l:available / 2
     let l:pad_right = l:available - l:pad_left
     return repeat(',', l:pad_left) . l:full_msg . repeat(',', l:pad_right)
 endfunction
@@ -576,139 +631,157 @@ function! s:UpdatePopupForResize(winid, frame_width, frame_height, has_border, b
 endfunction
 
 function! Nyan() abort
-    " Use original frames without scaling for actual display to avoid E805 errors
-    let l:frames = s:ANIMATION_FRAMES
-    let l:frame_width = s:BASE_FRAME_WIDTH
-    let l:frame_height = s:BASE_FRAME_HEIGHT
+    " Validate configuration at start
+    call s:ValidateConfig()
 
-    " Use fixed-point arithmetic only for checking if animation fits on screen
-    let l:user_scale_fixed = get(g:, 'nyancat_scale', 0) * 100
-    let l:auto_scale = (l:user_scale_fixed == 0)
+    " Reset any stale state from previous run
+    call s:Cleanup()
 
-    if l:auto_scale
-        let l:scale_fixed = s:CalculateScaleFactor()
-        if l:scale_fixed < 80
+    " Cache border style at animation start for performance
+    call s:CacheBorderStyle()
+
+    try
+        " Use original frames without scaling for actual display to avoid E805 errors
+        let l:frames = s:ANIMATION_FRAMES
+        let l:frame_width = s:BASE_FRAME_WIDTH
+        let l:frame_height = s:BASE_FRAME_HEIGHT
+
+        " Use fixed-point arithmetic only for checking if animation fits on screen
+        let l:user_scale_fixed = get(g:, 'nyancat_scale', 0) * 100
+        let l:auto_scale = (l:user_scale_fixed == 0)
+
+        if l:auto_scale
+            let l:scale_fixed = s:CalculateScaleFactor()
+            if l:scale_fixed < 80
+                echohl WarningMsg
+                echomsg printf('Window too small for Nyan Cat (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
+                echohl None
+                let s:nyan_winid = -1  " Reset winid on early return (Issue #7)
+                return
+            endif
+        endif
+
+        let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
+        if !l:fit_result.fits
             echohl WarningMsg
-            echomsg printf('Window too small for Nyan Cat (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
+            echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+                \ l:fit_result.req.cols, l:fit_result.req.lines, &columns, &lines)
             echohl None
+            let s:nyan_winid = -1  " Reset winid on early return (Issue #7)
             return
         endif
-    endif
+        let l:has_border = l:fit_result.has_border
+        let l:border_chars = l:fit_result.border_chars
 
-    let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
-    if !l:fit_result.fits
-        echohl WarningMsg
-        echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
-            \ l:fit_result.req.cols, l:fit_result.req.lines, &columns, &lines)
-        echohl None
-        return
-    endif
-    let l:has_border = l:fit_result.has_border
-    let l:border_chars = l:fit_result.border_chars
+        " Rainbow border setup
+        let l:use_rainbow_border = l:has_border && get(g:, 'nyancat_rainbow_border', 1)
+        if l:use_rainbow_border
+            let l:rainbow_highlights = [
+                \ 'NyanBorderRed', 'NyanBorderOrange', 'NyanBorderYellow',
+                \ 'NyanBorderGreen', 'NyanBorderLightBlue', 'NyanBorderDarkBlue'
+                \ ]
+        else
+            let l:rainbow_highlights = ['NyanBorder']
+        endif
 
-    " Rainbow border setup
-    let l:use_rainbow_border = l:has_border && get(g:, 'nyancat_rainbow_border', 1)
-    if l:use_rainbow_border
-        let l:rainbow_highlights = [
-            \ 'NyanBorderRed', 'NyanBorderOrange', 'NyanBorderYellow',
-            \ 'NyanBorderGreen', 'NyanBorderLightBlue', 'NyanBorderDarkBlue'
-            \ ]
-    else
-        let l:rainbow_highlights = ['NyanBorder']
-    endif
+        " Store winid in script variable for resize handler
+        let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
+        let s:nyan_winid = l:winid
+        call s:SetupSyntax(l:winid)
 
-    " Store winid in script variable for resize handler
-    let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
-    let s:nyan_winid = l:winid
-    call s:SetupSyntax(l:winid)
+        let l:status_line = s:BuildStatusLine(l:frame_width)
 
-    let l:status_line = s:BuildStatusLine(l:frame_width)
+        let l:frame_idx = 0          " Integer: 0 to frame_count-1
+        let l:frame_count = len(l:frames)
 
-    let l:color_index = 0
-    let l:frame_idx = 0          " Integer: 0 to frame_count-1
-    let l:frame_count = len(l:frames)
+        " Track user's original border preference for Issue #10
+        let l:user_wants_border = !empty(s:GetBorderStyle())
+        let l:prev_has_border = l:has_border
 
-    " Track user's original border preference for Issue #10
-    let l:user_wants_border = !empty(s:GetBorderStyle())
-    let l:prev_has_border = l:has_border
+        " Initialize last color index for rainbow border optimization (Issue #5)
+        let l:last_color_index = -1
 
-    " Initialize last color index for rainbow border optimization (Issue #5)
-    let l:last_color_index = -1
+        while 1
+            while l:frame_idx < l:frame_count
+                let l:frame = l:frames[l:frame_idx]
 
-    while 1
-        let l:frame_idx = l:frame_idx  " Continue from current position
-        while l:frame_idx < l:frame_count
-            let l:frame = l:frames[l:frame_idx]
+                " Check for resize before rendering frame (Issue #1: Use resize_pending instead of polling)
+                if s:resize_pending
+                    let s:resize_pending = 0
 
-            " Check for resize before rendering frame (Issue #1: Use resize_pending instead of polling)
-            if s:resize_pending
-                let s:resize_pending = 0
+                    " Use fixed-point arithmetic to check if animation still fits after resize
+                    if l:auto_scale
+                        let l:scale_fixed = s:CalculateScaleFactor()
+                        if l:scale_fixed < 80
+                            call popup_close(l:winid)
+                            echohl WarningMsg
+                            echomsg printf('Window too small after resize (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
+                            echohl None
+                            let s:nyan_winid = -1  " Reset winid on early return (Issue #7)
+                            return
+                        endif
+                    endif
 
-                " Use fixed-point arithmetic to check if animation still fits after resize
-                if l:auto_scale
-                    let l:scale_fixed = s:CalculateScaleFactor()
-                    if l:scale_fixed < 80
+                    " Always start from user preference, then fall back if needed (Issue #10)
+                    if l:user_wants_border
+                        let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
+                        let l:has_border = l:fit_result.has_border
+                        let l:border_chars = l:fit_result.border_chars
+                    else
+                        let l:has_border = 0
+                        let l:border_chars = []
+                    endif
+
+                    " Check if border state changed (requires popup recreation)
+                    let l:border_state_changed = (l:has_border != l:prev_has_border)
+
+                    if l:border_state_changed
+                        " Border state changed - must recreate popup
                         call popup_close(l:winid)
-                        echohl WarningMsg
-                        echomsg printf('Window too small after resize (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
-                        echohl None
-                        return
+                        let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, l:last_color_index >= 0 ? l:last_color_index : 0)
+                        let s:nyan_winid = l:winid
+                        call s:SetupSyntax(l:winid)
+                    else
+                        " Just reposition - no flicker (Issue #2)
+                        call s:UpdatePopupForResize(l:winid, l:frame_width, l:frame_height, l:has_border, l:border_chars, l:rainbow_highlights, l:last_color_index >= 0 ? l:last_color_index : 0)
+                    endif
+                    let l:prev_has_border = l:has_border
+                    let l:status_line = s:BuildStatusLine(l:frame_width)
+
+                    " Render the current frame after updating popup
+                    call popup_settext(l:winid, l:frame + ['', l:status_line])
+                    redraw
+                    break " Break to outer loop to continue at current animation position
+                endif
+
+                if l:use_rainbow_border
+                    let l:new_color_index = l:frame_idx % len(l:rainbow_highlights)
+                    if l:new_color_index != l:last_color_index
+                        call popup_setoptions(l:winid, {'borderhighlight': [l:rainbow_highlights[l:new_color_index]]})
+                        let l:last_color_index = l:new_color_index
                     endif
                 endif
 
-                " Always start from user preference, then fall back if needed (Issue #10)
-                if l:user_wants_border
-                    let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
-                    let l:has_border = l:fit_result.has_border
-                    let l:border_chars = l:fit_result.border_chars
-                else
-                    let l:has_border = 0
-                    let l:border_chars = []
-                endif
-
-                " Check if border state changed (requires popup recreation)
-                let l:border_state_changed = (l:has_border != l:prev_has_border)
-
-                if l:border_state_changed
-                    " Border state changed - must recreate popup
-                    call popup_close(l:winid)
-                    let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, l:color_index % len(l:rainbow_highlights))
-                    let s:nyan_winid = l:winid
-                    call s:SetupSyntax(l:winid)
-                else
-                    " Just reposition - no flicker (Issue #2)
-                    call s:UpdatePopupForResize(l:winid, l:frame_width, l:frame_height, l:has_border, l:border_chars, l:rainbow_highlights, l:color_index)
-                endif
-                let l:prev_has_border = l:has_border
-                let l:status_line = s:BuildStatusLine(l:frame_width)
-
-                " Render the current frame after updating popup
                 call popup_settext(l:winid, l:frame + ['', l:status_line])
+
                 redraw
-                break " Break to outer loop to continue at current animation position
-            endif
-
-            if l:use_rainbow_border
-                let l:new_color_index = l:frame_idx % len(l:rainbow_highlights)
-                if l:new_color_index != l:last_color_index
-                    call popup_setoptions(l:winid, {'borderhighlight': [l:rainbow_highlights[l:new_color_index]]})
-                    let l:last_color_index = l:new_color_index
+                if getchar(0)
+                    call popup_close(l:winid)
+                    let s:nyan_winid = -1  " Clear winid on close (Issue #1)
+                    return
                 endif
-            endif
+                execute 'sleep' s:frame_delay . 'm'
 
-            call popup_settext(l:winid, l:frame + ['', l:status_line])
-
-            redraw
-            if getchar(0)
-                call popup_close(l:winid)
-                let s:nyan_winid = -1  " Clear winid on close (Issue #1)
-                return
-            endif
-            execute 'sleep' s:frame_delay . 'm'
-
-            let l:frame_idx = (l:frame_idx + 1) % l:frame_count  " Simplify frame index management (Issue #6)
+                let l:frame_idx = (l:frame_idx + 1) % l:frame_count  " Simplify frame index management (Issue #6)
+            endwhile
         endwhile
-    endwhile
+    catch
+        echohl ErrorMsg
+        echomsg 'Nyan Cat error: ' . v:exception
+        echohl None
+    finally
+        call s:Cleanup()
+    endtry
 endfunction
 
 command! Nyan call Nyan()
