@@ -598,14 +598,11 @@ function! Nyan() abort
 
     " Animation loop - press any key to exit
     let l:color_index = 0
-
-    " Pre-allocate frame index to avoid repeated calculations
     let l:frame_idx = 0
     let l:frame_count = len(l:frames)
 
     while 1
         " Iterate through frames with optimized loop
-        let l:frame_idx = 0
         while l:frame_idx < l:frame_count
             let l:frame = l:frames[l:frame_idx]
 
@@ -655,22 +652,27 @@ function! Nyan() abort
                 endif
 
                 call popup_close(l:winid)
-                let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
+                let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, l:color_index % len(l:rainbow_highlights))
                 call s:SetupSyntax(l:winid)
                 let l:status_line = s:BuildStatusLine(l:frame_width)
-                redraw
-                " Reset color index when recreating popup
-                let l:color_index = 0
-                break " Break to outer while loop to restart frame rendering
-            endif
 
-            if l:use_rainbow_border
-                let l:opts = {'borderhighlight': [l:rainbow_highlights[l:color_index]]}
-                call popup_setoptions(l:winid, l:opts)
-                let l:color_index = (l:color_index + 1) % len(l:rainbow_highlights)
-            endif
+                " Render the current frame after recreating popup
+                call popup_settext(l:winid, l:frame + ['', l:status_line])
+                if l:use_rainbow_border
+                    let l:opts = {'borderhighlight': [l:rainbow_highlights[l:color_index]]}
+                    call popup_setoptions(l:winid, l:opts)
+                    " Even after resize, we still proceed to the next color in the sequence
+                    let l:color_index = (l:color_index + 1) % len(l:rainbow_highlights)
+                endif
+            else
+                if l:use_rainbow_border
+                    let l:opts = {'borderhighlight': [l:rainbow_highlights[l:color_index]]}
+                    call popup_setoptions(l:winid, l:opts)
+                    let l:color_index = (l:color_index + 1) % len(l:rainbow_highlights)
+                endif
 
-            call popup_settext(l:winid, l:frame + ['', l:status_line])
+                call popup_settext(l:winid, l:frame + ['', l:status_line])
+            endif
 
             " Redraw with proper timing to reduce flickering
             redraw
@@ -682,6 +684,8 @@ function! Nyan() abort
 
             let l:frame_idx += 1
         endwhile
+        " Reset frame index to start animation over after completing all frames
+        let l:frame_idx = 0
     endwhile
 endfunction
 
