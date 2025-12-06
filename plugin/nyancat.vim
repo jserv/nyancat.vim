@@ -26,9 +26,12 @@ let s:frame_delay = get(g:, 'nyancat_frame_delay', 85)
 " Status message text. User can override with g:nyancat_message.
 let s:message_text = get(g:, 'nyancat_message', 'Press any key to close')
 
-" Precompute frames for performance optimization (0=disabled, 1=enabled)
-" This loads common scale factors into memory at startup to avoid real-time scaling
-let s:precompute_frames = get(g:, 'nyancat_precompute_frames', 0)
+" Script-level state variables for performance optimization
+let s:resize_pending = 0
+let s:nyan_winid = -1
+let s:syntax_winid = -1
+let s:resize_timer = -1
+let s:debounce_ms = 50  " 50ms debounce window
 
 " Border style: 0=none, 1=ascii, 2=single, 3=double, 4=rounded, 5=thick
 " User can override with g:nyancat_border_style
@@ -54,71 +57,30 @@ function! s:GetBorderStyle() abort
     return get(s:BORDER_STYLES, l:style, s:BORDER_STYLES[1])
 endfunction
 
-" Cache for scaled animation frames
-let s:scaled_frames_cache = {}
+" Resize autocommand handler
+function! s:OnResize() abort
+    if s:nyan_winid == -1 || popup_getpos(s:nyan_winid) == {}
+        return
+    endif
 
-" Pre-computed common scale factors to optimize animation performance
-function! s:PrecomputeCommonScales() abort
-    " Define common scale factors to pre-compute (from 0.1 to 1.0 in 0.1 increments)
-    let l:common_scales = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    " Cancel pending timer
+    if s:resize_timer != -1
+        call timer_stop(s:resize_timer)
+    endif
 
-    " Precompute frames for each scale factor
-    for l:scale in l:common_scales
-        call s:GetScaledFrames(l:scale)
-    endfor
+    " Set new debounced timer
+    let s:resize_timer = timer_start(s:debounce_ms, {-> s:HandleDebouncedResize()})
 endfunction
 
-" Initialize precomputed scales on plugin load (if enabled)
-if s:precompute_frames
-    call s:PrecomputeCommonScales()
-endif
-
-" Scale animation frames to a new size using nearest-neighbor sampling.
-" Returns a list of frames, where each frame is a list of strings.
-function! s:GetScaledFrames(scale) abort
-    if a:scale <= 0
-        return []
-    endif
-    if a:scale == 1.0
-        return s:ANIMATION_FRAMES
-    endif
-    let l:scale_key = string(a:scale)
-    if has_key(s:scaled_frames_cache, l:scale_key)
-        return s:scaled_frames_cache[l:scale_key]
-    endif
-
-    let l:new_width = float2nr(s:BASE_FRAME_WIDTH * a:scale)
-    let l:new_height = float2nr(s:BASE_FRAME_HEIGHT * a:scale)
-
-    if l:new_width == 0 || l:new_height == 0
-        return [] " Cannot scale to zero size
-    endif
-
-    let l:scaled_frames = []
-    for l:original_frame in s:ANIMATION_FRAMES
-        let l:new_frame = []
-        for y in range(l:new_height)
-            let l:original_y = float2nr(y / a:scale)
-            if l:original_y >= len(l:original_frame)
-                continue
-            endif
-            let l:original_line = l:original_frame[l:original_y]
-            let l:new_line = ''
-            for x in range(l:new_width)
-                let l:original_x = float2nr(x / a:scale)
-                if l:original_x < len(l:original_line)
-                    let l:new_line .= strcharpart(l:original_line, l:original_x, 1)
-                endif
-            endfor
-            call add(l:new_frame, l:new_line)
-        endfor
-        call add(l:scaled_frames, l:new_frame)
-    endfor
-
-    let s:scaled_frames_cache[l:scale_key] = l:scaled_frames
-    return l:scaled_frames
+function! s:HandleDebouncedResize() abort
+    let s:resize_timer = -1
+    let s:resize_pending = 1
 endfunction
 
+augroup NyanResize
+    autocmd!
+    autocmd VimResized * call s:OnResize()
+augroup END
 
 " Calculate required screen size based on frame dimensions and border settings.
 function! s:GetRequiredSize(frame_width, frame_height) abort
@@ -130,6 +92,53 @@ function! s:GetRequiredSize(frame_width, frame_height) abort
         \ 'cols': a:frame_width + l:border_extra,
         \ 'lines': l:content_height + l:border_extra + &cmdheight + 1
         \ }
+endfunction
+
+" Helper function for scale calculation (Issue #4)
+" Calculate scale factor using fixed-point arithmetic (scale * 100)
+" Returns scale factor where 100 = 1.0x
+function! s:CalculateScaleFactor() abort
+    let l:border_chars = s:GetBorderStyle()
+    let l:has_border = !empty(l:border_chars)
+    let l:border_extra = l:has_border ? 2 : 0
+
+    let l:available_width = (&columns - l:border_extra) * 100
+    let l:available_height = (&lines - l:border_extra - &cmdheight - 1 - 2) * 100
+
+    let l:scale_w = l:available_width / s:BASE_FRAME_WIDTH
+    let l:scale_h = l:available_height / s:BASE_FRAME_HEIGHT
+
+    return l:scale_w < l:scale_h ? l:scale_w : l:scale_h
+endfunction
+
+" Helper function for border fallback (Issue #4)
+" Check if animation fits, with fallback to borderless mode
+" Returns: {'fits': bool, 'has_border': bool, 'border_chars': list, 'req': dict}
+function! s:CheckFitWithBorderFallback(frame_width, frame_height) abort
+    let l:border_chars = s:GetBorderStyle()
+    let l:has_border = !empty(l:border_chars)
+
+    let l:req = s:GetRequiredSize(a:frame_width, a:frame_height)
+    let l:fits = (&columns >= l:req.cols && &lines >= l:req.lines)
+
+    if l:fits
+        return {'fits': 1, 'has_border': l:has_border, 'border_chars': l:border_chars, 'req': l:req}
+    endif
+
+    " Try without borders
+    if l:has_border
+        let l:req_no_border = {
+            \ 'cols': l:req.cols - 2,
+            \ 'lines': l:req.lines - 2
+            \ }
+        let l:fits_no_border = (&columns >= l:req_no_border.cols && &lines >= l:req_no_border.lines)
+
+        if l:fits_no_border
+            return {'fits': 1, 'has_border': 0, 'border_chars': [], 'req': l:req_no_border}
+        endif
+    endif
+
+    return {'fits': 0, 'has_border': 0, 'border_chars': [], 'req': l:req}
 endfunction
 
 " Animation frames (12 frames for smooth animation)
@@ -444,10 +453,15 @@ highlight NyanBorderGreen     ctermbg=17 ctermfg=118 guibg=#003153 guifg=#87ff00
 highlight NyanBorderLightBlue ctermbg=17 ctermfg=33  guibg=#003153 guifg=#0087ff
 highlight NyanBorderDarkBlue  ctermbg=17 ctermfg=19  guibg=#003153 guifg=#0000af
 
-
 " Note: frame_delay and message_text are defined earlier in the file
 
 function! s:SetupSyntax(winid) abort
+    " Skip if syntax already applied to this window
+    if s:syntax_winid == a:winid
+        return
+    endif
+    let s:syntax_winid = a:winid
+
     call win_execute(a:winid, 'syntax clear')
     call win_execute(a:winid, 'syntax match NyanBlue /,/')
     call win_execute(a:winid, 'syntax match NyanWhite /\./')
@@ -470,25 +484,31 @@ endfunction
 " Build the status line with message centered in frame
 function! s:BuildStatusLine(frame_width) abort
     let l:decor = '****'
-    let l:fw = float2nr(a:frame_width)  " Ensure frame_width is integer
+    let l:fw = a:frame_width  " Integer already
     let l:max_msg_width = l:fw - (2 * strdisplaywidth(l:decor))
     if l:max_msg_width < 0
         let l:max_msg_width = 0
     endif
 
-    " Trim the message to fit the frame width (display width aware)
+    " Trim the message to fit the frame width (display width aware) - Issue #7 optimization
     let l:msg = s:message_text
     if strdisplaywidth(l:msg) > l:max_msg_width
-        let l:msg = ''
-        let l:i = 0
-        while l:i < strchars(s:message_text)
-            let l:char = strcharpart(s:message_text, l:i, 1)
-            if strdisplaywidth(l:msg . l:char) > l:max_msg_width
+        " Calculate character count that fits, then slice once
+        let l:char_count = 0
+        let l:display_width = 0
+        let l:total_chars = strchars(s:message_text)
+
+        while l:char_count < l:total_chars
+            let l:char = strcharpart(s:message_text, l:char_count, 1)
+            let l:char_width = strdisplaywidth(l:char)
+            if l:display_width + l:char_width > l:max_msg_width
                 break
             endif
-            let l:msg .= l:char
-            let l:i += 1
+            let l:display_width += l:char_width
+            let l:char_count += 1
         endwhile
+
+        let l:msg = strcharpart(s:message_text, 0, l:char_count)
     endif
 
     let l:full_msg = l:decor . l:msg . l:decor
@@ -529,70 +549,62 @@ function! s:CreatePopup(frame_width, frame_height, has_border, use_rainbow_borde
     return popup_create('', l:opts)
 endfunction
 
+" Helper function to update popup for resize without recreating (Issue #2)
+function! s:UpdatePopupForResize(winid, frame_width, frame_height, has_border, border_chars, rainbow_highlights, color_index) abort
+    let l:content_height = a:frame_height + 2
+
+    let l:opts = {
+        \ 'minwidth': a:frame_width,
+        \ 'maxwidth': a:frame_width,
+        \ 'minheight': l:content_height,
+        \ 'maxheight': l:content_height,
+        \ }
+
+    if a:has_border
+        let l:opts['border'] = [1, 1, 1, 1]
+        let l:opts['borderchars'] = a:border_chars
+        let l:opts['borderhighlight'] = [a:rainbow_highlights[a:color_index % len(a:rainbow_highlights)]]
+        let l:opts['padding'] = [0, 0, 0, 0]
+    else
+        let l:opts['border'] = []
+    endif
+
+    " Reposition and update options without recreating
+    call popup_move(a:winid, {'pos': 'center'})
+    call popup_setoptions(a:winid, l:opts)
+    return a:winid
+endfunction
+
 function! Nyan() abort
     " Use original frames without scaling for actual display to avoid E805 errors
     let l:frames = s:ANIMATION_FRAMES
-    let l:frame_width = float2nr(s:BASE_FRAME_WIDTH)
-    let l:frame_height = float2nr(s:BASE_FRAME_HEIGHT)
+    let l:frame_width = s:BASE_FRAME_WIDTH
+    let l:frame_height = s:BASE_FRAME_HEIGHT
 
     " Use fixed-point arithmetic only for checking if animation fits on screen
     let l:user_scale_fixed = get(g:, 'nyancat_scale', 0) * 100
     let l:auto_scale = (l:user_scale_fixed == 0)
 
-    if l:auto_scale " Check if animation fits using fixed-point arithmetic
-        let l:border_chars = s:GetBorderStyle()
-        let l:has_border = !empty(l:border_chars)
-        let l:border_extra = l:has_border ? 2 : 0
-
-        " Calculate scale factor using fixed-point arithmetic to determine if it fits
-        let l:available_width = (&columns - l:border_extra) * 100
-        let l:available_height = (&lines - l:border_extra - &cmdheight - 1 - 2) * 100
-
-        " Calculate scale as: min(available_width / BASE_WIDTH, available_height / BASE_HEIGHT, 100)
-        let l:scale_width_fixed = l:available_width / s:BASE_FRAME_WIDTH
-        let l:scale_height_fixed = l:available_height / s:BASE_FRAME_HEIGHT
-
-        " Take the minimum scale to see if original size fits
-        let l:calculated_scale_fixed = l:scale_width_fixed < l:scale_height_fixed ? l:scale_width_fixed : l:scale_height_fixed
-
-        " Check if the original size would be too small to fit meaningfully (scale < 80)
-        " Allow animation to run at smaller scale than 100 as long as it's > 80 (0.8x)
-        if l:calculated_scale_fixed < 80
+    if l:auto_scale
+        let l:scale_fixed = s:CalculateScaleFactor()
+        if l:scale_fixed < 80
             echohl WarningMsg
-            echomsg printf('Window too small for original Nyan Cat (scale %d.%02dx)', l:calculated_scale_fixed/100, l:calculated_scale_fixed%100)
+            echomsg printf('Window too small for Nyan Cat (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
             echohl None
             return
         endif
     endif
 
-    " Check if it fits with borders, and if not, try without borders
-    let l:req = s:GetRequiredSize(l:frame_width, l:frame_height)
-    let l:fits_with_borders = (&columns >= l:req.cols && &lines >= l:req.lines)
-
-    if !l:fits_with_borders
-        " Calculate required size without borders (subtract 2 from each dimension)
-        let l:req_no_border_cols = l:req.cols - 2
-        let l:req_no_border_lines = l:req.lines - 2
-        let l:fits_without_borders = (&columns >= l:req_no_border_cols && &lines >= l:req_no_border_lines)
-
-        if l:fits_without_borders
-            " Update border settings to remove borders
-            let l:has_border = 0
-            let l:border_chars = []
-        else
-            echohl WarningMsg
-            echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
-                \ l:req.cols, l:req.lines, &columns, &lines)
-            echohl None
-            return
-        endif
+    let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
+    if !l:fit_result.fits
+        echohl WarningMsg
+        echomsg printf('Screen too small for Nyan Cat (need %dx%d, have %dx%d)',
+            \ l:fit_result.req.cols, l:fit_result.req.lines, &columns, &lines)
+        echohl None
+        return
     endif
-
-    " Ensure border configuration is set if not already determined
-    if !exists('l:border_chars')
-        let l:border_chars = s:GetBorderStyle()
-        let l:has_border = !empty(l:border_chars)
-    endif
+    let l:has_border = l:fit_result.has_border
+    let l:border_chars = l:fit_result.border_chars
 
     " Rainbow border setup
     let l:use_rainbow_border = l:has_border && get(g:, 'nyancat_rainbow_border', 1)
@@ -605,138 +617,83 @@ function! Nyan() abort
         let l:rainbow_highlights = ['NyanBorder']
     endif
 
-    " Popup with border options
-    let l:opts = {
-        \ 'highlight': 'NyanBlue',
-        \ 'minwidth': l:frame_width,
-        \ 'maxwidth': l:frame_width,
-        \ 'minheight': l:frame_height + 2,
-        \ 'maxheight': l:frame_height + 2,
-        \ 'pos': 'center',
-        \ 'zindex': 100,
-        \ }
-
-    if l:has_border
-        let l:opts['border'] = [1, 1, 1, 1]
-        let l:opts['borderchars'] = l:border_chars
-        let l:opts['borderhighlight'] = [l:rainbow_highlights[0]]
-        let l:opts['padding'] = [0, 0, 0, 0]
-    else
-        let l:opts['borderhighlight'] = ['NyanBorder']
-    endif
-
-    let l:winid = popup_create('', l:opts)
+    " Store winid in script variable for resize handler
+    let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, 0)
+    let s:nyan_winid = l:winid
     call s:SetupSyntax(l:winid)
 
     let l:status_line = s:BuildStatusLine(l:frame_width)
-    let l:last_cols = &columns
-    let l:last_lines = &lines
 
     let l:color_index = 0
-    " Store the original frame index to continue from the same animation position after resize
-    let l:orig_frame_idx = 0
-    let l:frame_idx = 0
+    let l:frame_idx = 0          " Integer: 0 to frame_count-1
     let l:frame_count = len(l:frames)
 
+    " Track user's original border preference for Issue #10
+    let l:user_wants_border = !empty(s:GetBorderStyle())
+    let l:prev_has_border = l:has_border
+
+    " Initialize last color index for rainbow border optimization (Issue #5)
+    let l:last_color_index = -1
+
     while 1
-        let l:frame_idx = float2nr(l:orig_frame_idx)  " Start from stored position, ensure integer
+        let l:frame_idx = l:frame_idx  " Continue from current position
         while l:frame_idx < l:frame_count
             let l:frame = l:frames[l:frame_idx]
 
-            " Check for resize before rendering frame
-            if &columns != l:last_cols || &lines != l:last_lines
-                let l:last_cols = &columns
-                let l:last_lines = &lines
+            " Check for resize before rendering frame (Issue #1: Use resize_pending instead of polling)
+            if s:resize_pending
+                let s:resize_pending = 0
 
                 " Use fixed-point arithmetic to check if animation still fits after resize
                 if l:auto_scale
-                    let l:border_chars = s:GetBorderStyle()
-                    let l:has_border = !empty(l:border_chars)
-                    let l:new_border_extra = l:has_border ? 2 : 0
-
-                    " Calculate scale factor using fixed-point arithmetic to determine if it fits
-                    let l:new_available_width = (&columns - l:new_border_extra) * 100
-                    let l:new_available_height = (&lines - l:new_border_extra - &cmdheight - 1 - 2) * 100
-
-                    " Calculate scale as: min(available_width / BASE_WIDTH, available_height / BASE_HEIGHT, 100)
-                    let l:new_scale_width_fixed = l:new_available_width / s:BASE_FRAME_WIDTH
-                    let l:new_scale_height_fixed = l:new_available_height / s:BASE_FRAME_HEIGHT
-
-                    " Take the minimum scale to see if original size fits
-                    let l:new_calculated_scale_fixed = l:new_scale_width_fixed < l:new_scale_height_fixed ? l:new_scale_width_fixed : l:new_scale_height_fixed
-
-                    " Check if the original size would be too small to fit meaningfully (scale < 80)
-                    " Allow animation to run at smaller scale than 100 as long as it's > 80 (0.8x)
-                    if l:new_calculated_scale_fixed < 80
+                    let l:scale_fixed = s:CalculateScaleFactor()
+                    if l:scale_fixed < 80
                         call popup_close(l:winid)
                         echohl WarningMsg
-                        echomsg printf('Window too small after resize (scale %d.%02dx)', l:new_calculated_scale_fixed/100, l:new_calculated_scale_fixed%100)
+                        echomsg printf('Window too small after resize (scale %d.%02dx)', l:scale_fixed/100, l:scale_fixed%100)
                         echohl None
                         return
                     endif
                 endif
 
-                " Check if it fits with borders, and if not, try without borders
-                let l:req = s:GetRequiredSize(l:frame_width, l:frame_height)
-                let l:fits_with_borders = (&columns >= l:req.cols && &lines >= l:req.lines)
-
-                " If it doesn't fit with borders, check if it fits without borders
-                if !l:fits_with_borders
-                    " Calculate required size without borders (subtract 2 from each dimension)
-                    let l:req_no_border_cols = l:req.cols - 2
-                    let l:req_no_border_lines = l:req.lines - 2
-                    let l:fits_without_borders = (&columns >= l:req_no_border_cols && &lines >= l:req_no_border_lines)
-
-                    if l:fits_without_borders
-                        " Update border settings to remove borders
-                        let l:has_border = 0
-                        let l:border_chars = []
-                        let l:req = {'cols': l:req_no_border_cols, 'lines': l:req_no_border_lines}
-                    else
-                        call popup_close(l:winid)
-                        echohl WarningMsg
-                        echomsg printf('Screen too small after resize (need %dx%d, have %dx%d)',
-                            \ l:req.cols, l:req.lines, &columns, &lines)
-                        echohl None
-                        return
-                    endif
-                endif
-
-                call popup_close(l:winid)
-                let l:opts_resize = {
-                    \ 'highlight': 'NyanBlue',
-                    \ 'minwidth': l:frame_width,
-                    \ 'maxwidth': l:frame_width,
-                    \ 'minheight': l:frame_height + 2,
-                    \ 'maxheight': l:frame_height + 2,
-                    \ 'pos': 'center',
-                    \ 'zindex': 100,
-                    \ }
-
-                if l:has_border
-                    let l:opts_resize['border'] = [1, 1, 1, 1]
-                    let l:opts_resize['borderchars'] = l:border_chars
-                    let l:opts_resize['borderhighlight'] = [l:rainbow_highlights[float2nr(l:color_index % len(l:rainbow_highlights))]]
-                    let l:opts_resize['padding'] = [0, 0, 0, 0]
+                " Always start from user preference, then fall back if needed (Issue #10)
+                if l:user_wants_border
+                    let l:fit_result = s:CheckFitWithBorderFallback(l:frame_width, l:frame_height)
+                    let l:has_border = l:fit_result.has_border
+                    let l:border_chars = l:fit_result.border_chars
                 else
-                    let l:opts_resize['borderhighlight'] = ['NyanBorder']
+                    let l:has_border = 0
+                    let l:border_chars = []
                 endif
 
-                let l:winid = popup_create('', l:opts_resize)
-                call s:SetupSyntax(l:winid)
+                " Check if border state changed (requires popup recreation)
+                let l:border_state_changed = (l:has_border != l:prev_has_border)
+
+                if l:border_state_changed
+                    " Border state changed - must recreate popup
+                    call popup_close(l:winid)
+                    let l:winid = s:CreatePopup(l:frame_width, l:frame_height, l:has_border, l:use_rainbow_border, l:rainbow_highlights, l:color_index % len(l:rainbow_highlights))
+                    let s:nyan_winid = l:winid
+                    call s:SetupSyntax(l:winid)
+                else
+                    " Just reposition - no flicker (Issue #2)
+                    call s:UpdatePopupForResize(l:winid, l:frame_width, l:frame_height, l:has_border, l:border_chars, l:rainbow_highlights, l:color_index)
+                endif
+                let l:prev_has_border = l:has_border
                 let l:status_line = s:BuildStatusLine(l:frame_width)
 
-                " Render the current frame after recreating popup
+                " Render the current frame after updating popup
                 call popup_settext(l:winid, l:frame + ['', l:status_line])
                 redraw
                 break " Break to outer loop to continue at current animation position
             endif
 
             if l:use_rainbow_border
-                let l:color_index = float2nr(l:color_index)  " Ensure color index is integer before array access
-                let l:opts_border = {'borderhighlight': [l:rainbow_highlights[l:color_index]]}
-                call popup_setoptions(l:winid, l:opts_border)
-                let l:color_index = float2nr((l:color_index + 1) % len(l:rainbow_highlights))
+                let l:new_color_index = l:frame_idx % len(l:rainbow_highlights)
+                if l:new_color_index != l:last_color_index
+                    call popup_setoptions(l:winid, {'borderhighlight': [l:rainbow_highlights[l:new_color_index]]})
+                    let l:last_color_index = l:new_color_index
+                endif
             endif
 
             call popup_settext(l:winid, l:frame + ['', l:status_line])
@@ -744,15 +701,12 @@ function! Nyan() abort
             redraw
             if getchar(0)
                 call popup_close(l:winid)
+                let s:nyan_winid = -1  " Clear winid on close (Issue #1)
                 return
             endif
             execute 'sleep' s:frame_delay . 'm'
 
-            let l:frame_idx += 1
-            let l:orig_frame_idx = float2nr(l:frame_idx)  " Update the stored position, ensure integer
-            if l:orig_frame_idx >= l:frame_count
-                let l:orig_frame_idx = 0  " Loop animation
-            endif
+            let l:frame_idx = (l:frame_idx + 1) % l:frame_count  " Simplify frame index management (Issue #6)
         endwhile
     endwhile
 endfunction
